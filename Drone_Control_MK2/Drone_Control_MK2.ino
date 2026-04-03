@@ -204,6 +204,9 @@ float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
 float accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
 float baroOffset = 0.0f;
 
+float gRollTrim = ROLL_TRIM; // runtime trim — updated via /trim/set
+float gPitchTrim = PITCH_TRIM;
+
 float roll = 0, pitch = 0, yawRate = 0;
 float height = 0, velocity = 0;
 float gyroRollRate = 0, gyroPitchRate = 0, gyroYawRate = 0;
@@ -391,9 +394,9 @@ float altInput, altOutput;
 
 // Gains on 0-10 scale: 5 = half output at full-scale error, 10 = full output
 // inputMax: physical range of input  |  outMax: output in DSHOT units
-PIDController pidRoll (&rollInput, &rollSetpoint, &rollOutput, 1.5f, 0.0f, 0.0f, ROLL_MAX_MIN, 500.0f, 20.0f);
-PIDController pidPitch (&pitchInput, &pitchSetpoint, &pitchOutput, 1.5f, 0.0f, 0.0f, PITCH_MAX_MIN, 500.0f, 20.0f);
-PIDController pidYawRate (&yawRateInput, &yawRateSetpoint, &yawRateOutput, 1.5f, 0.0f, 0.0f, YAW_RATE_MAX_MIN, 360.0f, 20.0f);
+PIDController pidRoll (&rollInput, &rollSetpoint, &rollOutput, 2.0f, 0.0f, 0.0f, ROLL_MAX_MIN, 500.0f, 20.0f);
+PIDController pidPitch (&pitchInput, &pitchSetpoint, &pitchOutput, 2.0f, 0.0f, 0.0f, PITCH_MAX_MIN, 500.0f, 20.0f);
+PIDController pidYawRate (&yawRateInput, &yawRateSetpoint, &yawRateOutput, 2.5f, 0.0f, 0.0f, YAW_RATE_MAX_MIN, 360.0f, 20.0f);
 PIDController pidAlt (&altInput, &altSetpoint, &altOutput, 2.0f, 0.15f, 1.0f, 2.0f, 300.0f, 10.0f);
 float originalAltKi = pidAlt.ki;
 
@@ -580,8 +583,8 @@ void loop() {
   readSensors();
   global_dt = elapsed / 1000.0f;
 
-  rollSetpoint = rcRoll + ROLL_TRIM;
-  pitchSetpoint = -rcPitch + PITCH_TRIM; // negative: forward stick = nose down - PITCH_TRIM corrects fixed battery offset
+  rollSetpoint = rcRoll + gRollTrim;
+  pitchSetpoint = -rcPitch + gPitchTrim; // negative: forward stick = nose down - gPitchTrim corrects fixed battery offset
   yawRateSetpoint = rcYawRate;
 
   float gyroComp = rcYawRate * PROP_GYRO_COEFF;
@@ -1012,6 +1015,22 @@ void initHTTPTelemetry() {
                   pidPitch.kp,   pidPitch.ki,   pidPitch.kd,
                   pidYawRate.kp, pidYawRate.ki, pidYawRate.kd,
                   pidAlt.kp,     pidAlt.ki,     pidAlt.kd);
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+  server.on("/trim/get", []() {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"rollTrim\":%.2f,\"pitchTrim\":%.2f}",
+             gRollTrim, gPitchTrim);
+    server.send(200, "application/json", buf);
+  });
+  server.on("/trim/set", []() {
+    if (armed) {
+      server.send(403, "application/json", "{\"error\":\"disarm first\"}");
+      return;
+    }
+    if (server.hasArg("rollTrim"))  gRollTrim  = server.arg("rollTrim").toFloat();
+    if (server.hasArg("pitchTrim")) gPitchTrim = server.arg("pitchTrim").toFloat();
+    Serial.printf("Trim updated — Roll:%.2f  Pitch:%.2f\n", gRollTrim, gPitchTrim);
     server.send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -3397,6 +3416,37 @@ void handleRoot() {
     </div>
   </div>
 
+  <div class="panel" id="trim-panel" style="grid-column: 1 / -1;">
+    <div class="panel-title">SOFTWARE TRIM — DISARMED ONLY</div>
+    <div id="trim-armed-warning" style="display:none;font-family:var(--mono);font-size:11px;
+        color:var(--red);margin-bottom:10px;letter-spacing:1px;">
+      ⚠ DISARM BEFORE EDITING
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;max-width:400px;">
+      <div>
+        <div class="panel-title" style="margin-bottom:8px">ROLL</div>
+        <div class="pid-row"><span class="sensor-key">Trim °</span>
+          <input class="pid-input" id="trim-roll" type="number" step="0.5" min="-10" max="10"></div>
+      </div>
+      <div>
+        <div class="panel-title" style="margin-bottom:8px">PITCH</div>
+        <div class="pid-row"><span class="sensor-key">Trim °</span>
+          <input class="pid-input" id="trim-pitch" type="number" step="0.5" min="-10" max="10"></div>
+      </div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:12px;align-items:center;">
+      <button id="trim-apply" onclick="applyTrim()"
+        style="font-family:var(--mono);font-size:11px;letter-spacing:2px;padding:6px 18px;
+              background:transparent;border:1px solid var(--accent);color:var(--accent);
+              cursor:pointer;">APPLY</button>
+      <button onclick="loadTrim()"
+        style="font-family:var(--mono);font-size:11px;letter-spacing:2px;padding:6px 18px;
+              background:transparent;border:1px solid var(--dim);color:var(--dim);
+              cursor:pointer;">RELOAD</button>
+      <span id="trim-status" style="font-family:var(--mono);font-size:11px;color:var(--dim)"></span>
+    </div>
+  </div>
+
 </div><!-- /grid -->
 
 <script>
@@ -3601,9 +3651,12 @@ async function fetchData() {
 
     const isArmed = d.armed;
     document.querySelectorAll('.pid-input').forEach(el => el.disabled = isArmed);
-    document.getElementById('pid-apply').disabled      = isArmed;
-    document.getElementById('pid-apply').style.opacity = isArmed ? '0.3' : '1';
-    document.getElementById('pid-armed-warning').style.display = isArmed ? '' : 'none';
+    document.getElementById('pid-apply').disabled       = isArmed;
+    document.getElementById('pid-apply').style.opacity  = isArmed ? '0.3' : '1';
+    document.getElementById('pid-armed-warning').style.display  = isArmed ? '' : 'none';
+    document.getElementById('trim-apply').disabled      = isArmed;
+    document.getElementById('trim-apply').style.opacity = isArmed ? '0.3' : '1';
+    document.getElementById('trim-armed-warning').style.display = isArmed ? '' : 'none';
   } catch(e) {}
 }
 
@@ -3826,7 +3879,42 @@ async function applyPIDs() {
   }
 }
 
+async function loadTrim() {
+  try {
+    const t = await (await fetch('/trim/get')).json();
+    document.getElementById('trim-roll').value  = t.rollTrim.toFixed(2);
+    document.getElementById('trim-pitch').value = t.pitchTrim.toFixed(2);
+    document.getElementById('trim-status').textContent = 'loaded';
+    document.getElementById('trim-status').style.color = 'var(--dim)';
+  } catch(e) {
+    document.getElementById('trim-status').textContent = 'load failed';
+    document.getElementById('trim-status').style.color = 'var(--red)';
+  }
+}
+
+async function applyTrim() {
+  const params = new URLSearchParams({
+    rollTrim:  document.getElementById('trim-roll').value,
+    pitchTrim: document.getElementById('trim-pitch').value,
+  });
+  try {
+    const d = await (await fetch('/trim/set?' + params)).json();
+    const status = document.getElementById('trim-status');
+    if (d.ok) {
+      status.textContent = 'applied ✓';
+      status.style.color = 'var(--green)';
+    } else {
+      status.textContent = d.error || 'rejected';
+      status.style.color = 'var(--red)';
+    }
+  } catch(e) {
+    document.getElementById('trim-status').textContent = 'error';
+    document.getElementById('trim-status').style.color = 'var(--red)';
+  }
+}
+
 loadPIDs();
+loadTrim();
 drawHorizon(0, 0);
 drawCompass(0, false);
 checkArmedState();
